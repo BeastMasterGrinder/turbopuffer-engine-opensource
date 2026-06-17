@@ -7,15 +7,19 @@ else exists to hide its latency*. A core engine library plus a CLI (`create | up
 (S3-compatible) in Docker. Written in **readable Go**, faithful to the core architecture, not
 production scale — when a choice is between clever and clear, choose clear.
 
-**Status:** research + design are complete; there is no engine code yet. Implementation follows the
-build order in `docs/06`. You create `cmd/` and `internal/` as you build.
+**Status:** the engine + CLI are implemented under `cmd/tpuf/` and `internal/{storage,cache,engine}/`,
+following the `docs/06` build order. `go test ./...` passes with no infra; the real-MinIO contract test
+runs under `-tags=integration` once `docker compose up` is healthy. The `docs/06` e2e recipe works against
+MinIO end to end.
 
 ## Project map
 
 - `docs/` — the sourced knowledge base (01–07) + primary papers in `docs/papers/`. Start at `docs/README.md`.
 - `go.mod` / `go.sum` — module `github.com/farjad/turbopuffer-clone`, Go 1.26; sole external dep is `aws-sdk-go-v2/service/s3`.
-- `cmd/tpuf/` — the CLI (planned; per `docs/06`).
-- `internal/{storage,cache,engine}/` — engine packages (planned; per `docs/07`).
+- `cmd/tpuf/` — the CLI (`create | upsert | index | query | info`); backend via `TPUF_BACKEND=s3|memory`.
+- `cmd/tpuf-bench/` — latency benchmark (p50..p99.9 per op); `internal/bench/` is its percentile-stats helper.
+- `cmd/tpuf-node/` + `deploy/` — optional demo: HTTP query nodes behind an nginx consistent-hash LB (compose `lb` profile); see `deploy/README.md`.
+- `internal/{storage,cache,engine}/` — engine packages (layout per `docs/07`); co-located `*_test.go`.
 
 This repo is **documentation-first**: the hard decisions are already made and sourced in `docs/`. Read
 the relevant doc before building — don't reinvent them.
