@@ -1,0 +1,106 @@
+# MinIO is the S3-compatible object store that backs `tpuf`. It is the source of
+# truth: the engine persists every WAL segment, index epoch, and the manifest here.
+# The `mc` one-shot job waits for MinIO to come up, then idempotently creates the
+# bucket so a fresh `docker compose up -d` lands you in a ready-to-use state.
+#
+# Credentials and the bucket name come from the environment (see .env.example).
+# Load them first:  set -a; source .env.example; set +a
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: tpuf-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000" # S3 API
+      - "9001:9001" # web console (http://localhost:9001)
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  # One-shot job: wait for MinIO health, then create the `tpuf` bucket if absent.
+  # `mc mb --ignore-existing` makes re-runs a no-op, so this is safe to repeat.
+  createbucket:
+    image: minio/mc:latest
+    container_name: tpuf-createbucket
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      TPUF_BUCKET: ${TPUF_BUCKET:-tpuf}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 \"$${MINIO_ROOT_USER}\" \"$${MINIO_ROOT_PASSWORD}\";
+      mc mb --ignore-existing local/\"$${TPUF_BUCKET}\";
+      mc ls local;
+      echo 'bucket ready: '\"$${TPUF_BUCKET}\";
+      "
+    restart: "no"
+
+  # ----------------------------------------------------------------------------
+  # Optional load-balancer demo (profile "lb"): three identical tpuf-node query
+  # servers behind an nginx consistent-hash load balancer that routes by namespace.
+  # Start with:  docker compose --profile lb up -d --build
+  # All three nodes share the same MinIO, so any node can serve any namespace; the
+  # LB just keeps each namespace on one node for cache warmth. See deploy/README.md.
+  # ----------------------------------------------------------------------------
+  node0: &tpuf-node
+    profiles: ["lb"]
+    build: { context: ., dockerfile: deploy/Dockerfile }
+    image: tpuf-node:local
+    environment: &node-env
+      NODE_ID: node0
+      TPUF_BACKEND: s3
+      TPUF_S3_ENDPOINT: http://minio:9000
+      TPUF_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      TPUF_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      TPUF_BUCKET: ${TPUF_BUCKET:-tpuf}
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  node1:
+    <<: *tpuf-node
+    environment:
+      <<: *node-env
+      NODE_ID: node1
+
+  node2:
+    <<: *tpuf-node
+    environment:
+      <<: *node-env
+      NODE_ID: node2
+
+  # A 4th node, available for the "add a node" remap demo (deploy/remap-demo.sh).
+  # It runs alongside the others; nginx only routes to it once the demo adds it
+  # to the upstream and reloads.
+  node3:
+    <<: *tpuf-node
+    environment:
+      <<: *node-env
+      NODE_ID: node3
+
+  lb:
+    profiles: ["lb"]
+    build: { context: ., dockerfile: deploy/Dockerfile.nginx } # bakes deploy/nginx.conf
+    image: tpuf-lb:local
+    container_name: tpuf-lb
+    ports:
+      - "8088:8080" # the namespace-routing entry point (host 8088 -> nginx 8080)
+    depends_on:
+      - node0
+      - node1
+      - node2
+      - node3
+
+volumes:
+  minio-data:
