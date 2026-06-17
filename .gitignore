@@ -1,0 +1,25 @@
+# Compiled binaries (built ad hoc; the project runs via `go run` / a temp build)
+/tpuf
+/tpuf-bench
+/tpuf-node
+*.exe
+
+# Test & coverage artifacts
+*.out
+coverage.*
+
+# Local environment — the committed template is .env.example
+.env
+
+# Generated benchmark output (from `benchmarks/run.sh --save`); RESULTS.txt is curated and kept
+/benchmarks/run-*.txt
+
+# Local agent settings (the go-best-practices skill under .claude/skills is tracked)
+.claude/settings.local.json
+
+# Editor / OS cruft
+.DS_Store
+*~
+*.swp
+.idea/
+.vscode/
