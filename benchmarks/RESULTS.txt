@@ -1,0 +1,202 @@
+tpuf latency benchmark — results
+================================
+
+Generated locally with `go run ./cmd/tpuf-bench` (no external downloads). Numbers
+are hardware-dependent (this is one developer machine, MinIO in local Docker), so
+read the *shape* — the gap between the unindexed WAL-tail scan and the indexed
+path, and the cold-vs-hot cache breakdown — not the absolute milliseconds.
+
+Toolchain: Go 1.26.1, MinIO in docker-compose (path-style S3, localhost:9000).
+Run parameters (both backends): dim=64 metric=cosine text-field=body
+                                docs=500 batch=50 (=10 WAL segments)
+                                queries=3000 warmup=100 top-k=10 n-probe=3 seed=1
+
+Percentiles use the nearest-rank method, so every figure (incl. p99.9) is an
+actually-observed latency. 3000 samples make p99 (~rank 2970), p99.9 (~rank 2997)
+and max (rank 3000) land on distinct observations.
+
+How to reproduce
+----------------
+  # memory backend — pure engine/algorithm cost, no infrastructure:
+  go run ./cmd/tpuf-bench --backend memory --dim 64 --docs 500 --batch 50 --queries 3000 --warmup 100 --seed 1
+
+  # MinIO backend — real object-storage round-trip latency:
+  docker compose up -d
+  set -a; source .env.example; set +a
+  go run ./cmd/tpuf-bench --backend s3 --dim 64 --docs 500 --batch 50 --queries 3000 --warmup 100 --seed 1
+
+
+========================================================================
+MEMORY backend (pure engine/algorithm cost)
+========================================================================
+OPERATION               N     MIN       P50       P90       P95       P99       P99.9     MAX       MEAN      OPS/S
+upsert (batch)          10    313.77µs  320.72µs  384.77µs  444.58µs  444.58µs  444.58µs  444.58µs  340.84µs  2934
+query-vec (tail scan)   3000  5.205ms   6.454ms   8.73ms    9.785ms   11.874ms  13.805ms  15.685ms  6.943ms   144
+query-bm25 (tail scan)  3000  5.308ms   6.626ms   8.948ms   9.756ms   11.549ms  13.915ms  16.46ms   7.069ms   141
+index (build)           1     16.541ms  16.541ms  16.541ms  16.541ms  16.541ms  16.541ms  16.541ms  16.541ms  60
+query-vec (indexed)     3000  630.86µs  1.597ms   2.353ms   2.726ms   3.379ms   4.275ms   5.023ms   1.708ms   586
+query-bm25 (indexed)    3000  1.868ms   3.524ms   4.563ms   4.88ms    5.517ms   6.666ms   6.943ms   3.484ms   287
+
+index: epoch=1  K=22 clusters (≈√500) over 500 vectors  cluster size min/median/max=2/21/50
+
+DRAM cache (indexed query phases — tail scans bypass it by design):
+  query-vec  warmup (cold start) :    380 hits    20 misses  →  95.0% hot
+  query-vec  measured (steady)   :  11997 hits     3 misses  → 100.0% hot
+  query-bm25 warmup (cold start) :    198 hits     2 misses  →  99.0% hot
+  query-bm25 measured (steady)   :   6000 hits     0 misses  → 100.0% hot
+
+
+========================================================================
+S3 / MinIO backend (real object-storage latency)
+========================================================================
+OPERATION               N     MIN        P50        P90        P95        P99        P99.9      MAX        MEAN       OPS/S
+upsert (batch)          10    19.403ms   19.777ms   20.652ms   21.098ms   21.098ms   21.098ms   21.098ms   20.042ms   50
+query-vec (tail scan)   3000  12.587ms   18.23ms    21.786ms   23.767ms   27.723ms   33.207ms   51.121ms   18.638ms   54
+query-bm25 (tail scan)  3000  13.818ms   18.509ms   21.982ms   23.773ms   26.9ms     31.76ms    36.639ms   19.056ms   52
+index (build)           1     218.585ms  218.585ms  218.585ms  218.585ms  218.585ms  218.585ms  218.585ms  218.585ms  5
+query-vec (indexed)     3000  1.197ms    2.884ms    3.647ms    4.017ms    4.908ms    6.123ms    10.309ms   2.934ms    341
+query-bm25 (indexed)    3000  2.603ms    4.136ms    4.919ms    5.232ms    5.85ms     7.225ms    7.758ms    4.156ms    241
+
+index: epoch=1  K=22 clusters (≈√500) over 500 vectors  cluster size min/median/max=2/19/55
+
+DRAM cache (indexed query phases — tail scans bypass it by design):
+  query-vec  warmup (cold start) :    379 hits    21 misses  →  94.8% hot
+  query-vec  measured (steady)   :  11998 hits     2 misses  → 100.0% hot
+  query-bm25 warmup (cold start) :    198 hits     2 misses  →  99.0% hot
+  query-bm25 measured (steady)   :   6000 hits     0 misses  → 100.0% hot
+
+
+Reading the numbers
+-------------------
+1. Indexing is the whole point. On MinIO, vector p99 drops 27.7ms (tail scan) to
+   4.9ms (indexed) — ~5.6x. The tail scan re-reads the manifest plus all 10 WAL
+   segments from object storage on EVERY query (the WAL is never cached, by
+   correctness rule 2); the indexed path probes 3 of 22 clusters and serves them
+   from the DRAM cache.
+
+2. Cold start is tiny and one-shot. Per vector query there are 4 cached reads
+   (1 centroids + 3 cluster probes). The ~20 misses during warmup are simply each
+   distinct index object being read once; after that the measured window is
+   ~100% hot (2-3 stragglers are clusters first probed after warmup). BM25 has
+   exactly 2 cold reads (bm25.json + docs.json), then 100% hot.
+
+3. The index summary shows k-means at work: K = round(sqrt(500)) = 22 posting
+   lists, with an uneven size spread (min 2, median ~20, max ~55) — real IVF
+   clusters are not uniform.
+
+4. The memory backend isolates algorithm cost: even with zero network, the tail
+   scan is ~3-4x slower than the indexed path because it unmarshals all 500 docs
+   per query. Object storage widens that gap; it does not create it.
+
+
+########################################################################
+########################################################################
+MULTI-TENANT (concurrent) benchmarks
+########################################################################
+########################################################################
+
+These use `--namespaces N --concurrency C`: N tenants are each created + indexed,
+then C worker goroutines issue queries spread across all tenants, sharing ONE
+DRAM cache. `--cache-objects M` bounds that cache (LRU eviction) so that when the
+resident working set exceeds M, cold-start misses recur — the multi-tenant
+pressure a finite DRAM tier (and the real product's NVMe tier) has to absorb.
+
+Note: at dim=256 with C oversubscribing the cores, these queries are CPU-bound on
+the RaBitQ prefilter + exact rerank (float math), so the cache's network savings
+are real but partially masked by CPU contention. The latency is "under load", not
+single-query latency. Numbers are this-machine-specific; read the shape.
+
+
+========================================================================
+MEMORY · 20 tenants · dim=256 · 2000 docs/tenant · 16 workers · 20000 queries
+cache = BOUNDED to 200 objects
+========================================================================
+setup: 20 tenants × 2000 docs created + indexed in 13.98s
+
+OPERATION                N      MIN        P50        P90        P95        P99        P99.9      MAX        MEAN       OPS/S
+index (build/tenant)     20     438.192ms  648.147ms  788.722ms  790.935ms  810.339ms  810.339ms  810.339ms  645.762ms  2
+query-vec (concurrent)   20000  12.607ms   60.668ms   93.994ms   106.203ms  136.919ms  181.736ms  300.824ms  63.985ms   16
+query-bm25 (concurrent)  20000  14.837ms   48.561ms   72.901ms   82.787ms   106.077ms  152.763ms  207.865ms  50.237ms   20
+
+achieved throughput (16 concurrent workers, wall-clock):  query-vec 248 qps   query-bm25 316 qps
+shared DRAM cache (working set = 20 tenants):
+  query-vec  load :    44293 hits    35707 misses    35545 evictions  →  55.4% hot
+  query-bm25 load :    39956 hits       44 misses       40 evictions  →  99.9% hot
+  -> vector index is ~48 objects/tenant (centroids + ~45 clusters); 20 tenants need
+     ~960 cached but only 200 fit -> heavy churn. BM25 needs 2 objects/tenant (=40
+     total), fits easily -> stays hot. Same cache, opposite outcome.
+
+
+========================================================================
+MinIO · 12 tenants · dim=256 · 1000 docs/tenant · 12 workers · 6000 queries
+A) cache = BOUNDED to 80 objects
+========================================================================
+setup: 12 tenants × 1000 docs created + indexed in 8.489s
+
+OPERATION                N     MIN        P50        P90        P95        P99        P99.9      MAX        MEAN       OPS/S
+index (build/tenant)     12    472.444ms  503.509ms  558.606ms  588.792ms  588.792ms  588.792ms  588.792ms  518.442ms  2
+query-vec (concurrent)   6000  15.996ms   46.788ms   66.894ms   73.844ms   88.563ms   116.217ms  135.292ms  48.689ms   21
+query-bm25 (concurrent)  6000  11.196ms   26.66ms    37.22ms    41.687ms   50.068ms   62.251ms   76.644ms   27.876ms   36
+
+achieved throughput (12 workers, wall-clock):  query-vec 244 qps   query-bm25 423 qps
+shared DRAM cache (working set = 12 tenants):
+  query-vec  load :    12616 hits    11384 misses    11176 evictions  →  52.6% hot
+  query-bm25 load :    11968 hits       32 misses       24 evictions  →  99.7% hot
+
+B) cache = UNBOUNDED (same workload)
+========================================================================
+OPERATION                N     MIN        P50        P90        P95        P99        P99.9      MAX        MEAN       OPS/S
+query-vec (concurrent)   6000  10.067ms   39.137ms   60.285ms   67.826ms   84.226ms   111.367ms  143.036ms  41.362ms   24
+query-bm25 (concurrent)  6000  10.364ms   22.371ms   31.926ms   35.362ms   43.117ms   53.095ms   58.119ms   23.469ms   43
+
+achieved throughput (12 workers, wall-clock):  query-vec 286 qps   query-bm25 508 qps
+shared DRAM cache (working set = 12 tenants):
+  query-vec  load :    23718 hits      282 misses        0 evictions  →  98.8% hot
+  query-bm25 load :    11972 hits       28 misses        0 evictions  →  99.8% hot
+
+A vs B (the cache's payoff under multi-tenancy):
+  vector hit rate   52.6%  ->  98.8%   (11384 cold MinIO refetches eliminated)
+  vector p50        46.8ms ->  39.1ms
+  vector qps         244   ->   286    (+17%)
+  bm25   qps         423   ->   508    (+20%)
+  The win is modest here only because dim=256 + 12 workers is CPU-bound; on a
+  network-bound (higher-dim / lower-concurrency) workload the gap widens.
+
+
+########################################################################
+########################################################################
+COLD vs HOT (same query, first call vs repeat) — direct cache evidence
+########################################################################
+########################################################################
+
+`--coldstart-trials N`: build one indexed namespace, then for each trial wrap the
+SAME backend in a FRESH EMPTY cache and time a query twice — first COLD (index
+objects fetched from object storage), then the identical query HOT (those objects
+now in DRAM). This isolates the cache's effect on a single repeated query.
+The manifest is read uncached on every query (rule 2), so even HOT makes one
+round-trip; the delta is the index-object fetches the cache eliminates.
+
+========================================================================
+MinIO · 300 trials · dim=128 · 3000 docs
+========================================================================
+OPERATION                      N    MIN       P50       P90       P95       P99       P99.9     MAX       MEAN      OPS/S
+query-vec  COLD (cache empty)  300  8.808ms   13.494ms  16.745ms  18.242ms  21.517ms  23.535ms  23.535ms  13.657ms  73
+query-vec  HOT  (cache warm)   300  4.472ms   7.88ms    10.772ms  11.593ms  13.235ms  14.556ms  14.556ms  8.176ms   122
+query-bm25 COLD (cache empty)  300  18.351ms  22.678ms  26.525ms  28.552ms  31.685ms  35.526ms  35.526ms  23.178ms  43
+query-bm25 HOT  (cache warm)   300  14.628ms  18.478ms  21.581ms  23.82ms   26.267ms  28.333ms  28.333ms  18.766ms  53
+
+cold → hot (same query, second call served from DRAM):
+  query-vec  : p50 13.494ms → 7.880ms (1.7x)   p99 21.517ms → 13.235ms (1.6x)
+               cold pass = 1200 misses total (300 × 4 index objects), hot pass = 0 misses
+  query-bm25 : p50 22.678ms → 18.478ms (1.2x)  p99 31.685ms → 26.267ms (1.2x)
+               cold pass = 600 misses total (300 × 2 index objects), hot pass = 0 misses
+
+Memory backend (same experiment): cold ≈ hot (~1.0x). Both read from RAM, so there
+is no network to save — which is the point: the DRAM cache buys you the avoided
+object-storage round-trip, nothing more. On MinIO that round-trip is the win.
+
+Why bm25's speedup (1.2x) is smaller than vector's (1.7x): the cache stores RAW
+bytes, so the JSON unmarshal + BM25 scoring still run on every (cold AND hot)
+query. bm25.json/docs.json for 3000 docs are large, so fetch is a smaller fraction
+of total query time than for vector's 4 smaller objects. The cache saves network,
+not compute.
