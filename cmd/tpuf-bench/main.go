@@ -298,34 +298,49 @@ func runMultiTenant(ctx context.Context, cfg config, out io.Writer) error {
 		}
 	}
 
-	stats := []bench.Stats{indexRec.Summarize()}
-
-	vStats, vQPS, vCache, err := concurrentLoad(ctx, "query-vec (concurrent)", cfg, store, func(r *rand.Rand) error {
-		i := r.Intn(len(handles))
-		tenantHits[i].Add(1)
-		return vectorQuery(ctx, handles[i], vecPool[r.Intn(len(vecPool))], cfg)
-	})
-	if err != nil {
-		return fmt.Errorf("vector load: %w", err)
-	}
-	stats = append(stats, vStats)
-
-	var tQPS float64
-	var tCache cache.CacheStats
+	// Run both concurrent phases under a live dashboard (on a TTY) or plain
+	// progress lines (otherwise). The dashboard reads the shared phase counters;
+	// an abort (ctrl+c) cancels loadCtx so in-flight queries stop.
 	haveText := cfg.textField != ""
+	loadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var vecDone, bm25Done atomic.Int64
+	var vStats, tStats bench.Stats
+	var vQPS, tQPS float64
+	var vCache, tCache cache.CacheStats
+	var loadErr error
+
+	phases := []loadPhase{{name: "query-vec", total: int64(cfg.queries), done: &vecDone}}
 	if haveText {
-		tStats, qps, tc, err := concurrentLoad(ctx, "query-bm25 (concurrent)", cfg, store, func(r *rand.Rand) error {
+		phases = append(phases, loadPhase{name: "query-bm25", total: int64(cfg.queries), done: &bm25Done})
+	}
+
+	cacheBefore := store.Stats()
+	start := time.Now()
+	displayLoad("multi-tenant load", phases, store, cacheBefore, start, cancel, func() {
+		vStats, vQPS, vCache, loadErr = concurrentLoad(loadCtx, "query-vec (concurrent)", cfg, store, &vecDone, func(r *rand.Rand) error {
 			i := r.Intn(len(handles))
 			tenantHits[i].Add(1)
-			return textQuery(ctx, handles[i], textPool[r.Intn(len(textPool))], cfg)
+			return vectorQuery(loadCtx, handles[i], vecPool[r.Intn(len(vecPool))], cfg)
 		})
-		if err != nil {
-			return fmt.Errorf("bm25 load: %w", err)
+		if loadErr != nil || !haveText {
+			return
 		}
-		stats = append(stats, tStats)
-		tQPS, tCache = qps, tc
+		tStats, tQPS, tCache, loadErr = concurrentLoad(loadCtx, "query-bm25 (concurrent)", cfg, store, &bm25Done, func(r *rand.Rand) error {
+			i := r.Intn(len(handles))
+			tenantHits[i].Add(1)
+			return textQuery(loadCtx, handles[i], textPool[r.Intn(len(textPool))], cfg)
+		})
+	})
+	if loadErr != nil {
+		return fmt.Errorf("load: %w", loadErr)
 	}
 
+	stats := []bench.Stats{indexRec.Summarize(), vStats}
+	if haveText {
+		stats = append(stats, tStats)
+	}
 	if err := bench.WriteTable(out, stats); err != nil {
 		return err
 	}
@@ -364,36 +379,14 @@ func runMultiTenant(ctx context.Context, cfg config, out io.Writer) error {
 // throughput, and the cache delta over the load. Each worker keeps its own
 // Recorder and PRNG (neither is safe for concurrent use); the per-worker
 // recorders are merged once all workers finish.
-func concurrentLoad(ctx context.Context, name string, cfg config, store *cache.Store, do func(r *rand.Rand) error) (bench.Stats, float64, cache.CacheStats, error) {
+func concurrentLoad(ctx context.Context, name string, cfg config, store *cache.Store, counter *atomic.Int64, do func(r *rand.Rand) error) (bench.Stats, float64, cache.CacheStats, error) {
 	recs := make([]*bench.Recorder, cfg.concurrency)
 	errs := make([]error, cfg.concurrency)
 	base, rem := cfg.queries/cfg.concurrency, cfg.queries%cfg.concurrency
 
 	cacheBefore := store.Stats()
-	var done atomic.Int64 // completed queries, for live progress
 	var wg sync.WaitGroup
 	start := time.Now()
-
-	// Progress ticker → stderr (so it never pollutes the stdout report). It only
-	// prints if the load runs longer than the interval, so fast runs (and tests)
-	// stay silent. Stopped via the channel once all workers finish.
-	stop := make(chan struct{})
-	go func() {
-		t := time.NewTicker(2 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-t.C:
-				d := done.Load()
-				el := time.Since(start).Seconds()
-				c := store.Stats().Sub(cacheBefore)
-				fmt.Fprintf(os.Stderr, "  …%s %d/%d queries (%.0f qps, cache %.0f%% hot)\n",
-					name, d, cfg.queries, float64(d)/el, c.HitRate()*100)
-			}
-		}
-	}()
 
 	for w := 0; w < cfg.concurrency; w++ {
 		recs[w] = bench.NewRecorder("")
@@ -411,12 +404,11 @@ func concurrentLoad(ctx context.Context, name string, cfg config, store *cache.S
 					errs[w] = err
 					return
 				}
-				done.Add(1)
+				counter.Add(1) // shared progress counter read by the live dashboard
 			}
 		}(w, n)
 	}
 	wg.Wait()
-	close(stop)
 	elapsed := time.Since(start)
 
 	for _, e := range errs {

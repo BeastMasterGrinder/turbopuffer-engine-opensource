@@ -193,8 +193,11 @@ go run ./cmd/tpuf-bench --backend s3 --namespaces 12 --concurrency 12 \
     --dim 256 --docs 1000 --queries 6000 --cache-objects 0      # unbounded: every tenant stays resident
 ```
 
-It reports aggregate p50…p99.9 under load, achieved wall-clock throughput, and the shared cache's
-hit/miss/eviction counts. Capping the cache below the working set drops the vector hit rate sharply
+On a terminal, multi-tenant runs show a **live [Bubble Tea](https://github.com/charmbracelet/bubbletea)
+dashboard** (per-phase progress bars, throughput, cache hit-rate, and ETA); piped or non-TTY runs fall
+back to plain periodic progress lines. It reports aggregate p50…p99.9 under load, achieved wall-clock
+throughput, and the shared cache's hit/miss/eviction counts. Capping the cache below the working set
+drops the vector hit rate sharply
 (e.g. ~99% → ~53%) because each tenant's vector index is many objects (centroids + cluster files),
 while BM25 — two objects per tenant — stays hot.
 
@@ -296,6 +299,9 @@ passes under `-tags=integration`. The full end-to-end recipe in
 [`docs/06`](./docs/06-implementation-blueprint.md) runs against MinIO. The research and design remain
 sourced in [`docs/`](./docs).
 
-The single external dependency is `aws-sdk-go-v2/service/s3`. Everything conceptually interesting —
-vector math, k-means, the RaBitQ-lite codes, BM25, and the CAS loop — is hand-written standard-library
-Go, because reaching for a library to implement a core concept would defeat the point of the clone.
+The **engine's** single external dependency is `aws-sdk-go-v2/service/s3`. Everything conceptually
+interesting — vector math, k-means, the RaBitQ-lite codes, BM25, and the CAS loop — is hand-written
+standard-library Go, because reaching for a library to implement a core concept would defeat the point of
+the clone. The one exception is the optional benchmark CLI (`cmd/tpuf-bench`), which uses
+`charmbracelet/bubbletea` + `bubbles` + `lipgloss` for its live progress TUI — dev tooling that sits
+outside the engine, so the engine's single-dependency invariant holds.

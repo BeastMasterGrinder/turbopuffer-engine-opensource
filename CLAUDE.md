@@ -47,9 +47,11 @@ go run ./cmd/tpuf create demo --dim 4 --metric cosine --text-field body   # full
 
 <important if="you are adding a dependency, or hand-writing vector math, k-means, RaBitQ, BM25, or the CAS loop">
 
-Keep exactly **one** external dependency: `aws-sdk-go-v2/service/s3`. Everything conceptually
-interesting is hand-written stdlib — reaching for a library to implement a core concept defeats the
-purpose of the clone.
+The **engine** (`internal/`) keeps exactly **one** external dependency: `aws-sdk-go-v2/service/s3`.
+Everything conceptually interesting is hand-written stdlib — reaching for a library to implement a core
+concept defeats the purpose of the clone. The only exception is the optional benchmark CLI
+(`cmd/tpuf-bench`), which uses `charmbracelet/bubbletea`+`bubbles`+`lipgloss` for its live TUI — that's
+dev tooling, not the engine, so the engine's single-dependency invariant stands.
 </important>
 
 <important if="you are writing or running tests">
