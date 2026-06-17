@@ -1,0 +1,7 @@
+# Bakes the load-balancer config into the image so /etc/nginx/nginx.conf lives in
+# the container's own writable layer. That lets deploy/remap-demo.sh reconfigure
+# nginx (add a node) by writing the file via `docker exec` and reloading — without
+# depending on single-file bind-mount propagation, which is unreliable across
+# Docker setups.
+FROM nginx:alpine
+COPY deploy/nginx.conf /etc/nginx/nginx.conf
