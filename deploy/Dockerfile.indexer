@@ -1,0 +1,14 @@
+# Builds the tpuf-indexer daemon as a small static binary. Used by the indexer0,
+# indexer1 services in docker-compose's "indexer" profile: each claims a job from
+# queue.json and runs the engine's BuildIndex out of band
+# (docs/extensions/broker-indexer-queue.md).
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /tpuf-indexer ./cmd/tpuf-indexer
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /tpuf-indexer /tpuf-indexer
+ENTRYPOINT ["/tpuf-indexer"]

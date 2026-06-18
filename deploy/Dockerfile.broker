@@ -1,0 +1,15 @@
+# Builds the tpuf-broker as a small static binary. Used by the broker service in
+# docker-compose's "indexer" profile: the stateless single-writer that
+# group-commits reindex notifications into queue.json
+# (docs/extensions/broker-indexer-queue.md).
+FROM golang:1.26 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /tpuf-broker ./cmd/tpuf-broker
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /tpuf-broker /tpuf-broker
+EXPOSE 8090
+ENTRYPOINT ["/tpuf-broker"]

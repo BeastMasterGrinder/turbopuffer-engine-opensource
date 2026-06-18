@@ -102,5 +102,54 @@ services:
       - node2
       - node3
 
+  # ----------------------------------------------------------------------------
+  # Async indexing demo (profile "indexer"): one stateless broker fronting the
+  # shared queue.json, plus TWO indexer daemons that claim jobs from it and run
+  # the engine's BuildIndex out of band — turbopuffer's compute-compute separation
+  # (docs/extensions/broker-indexer-queue.md). All three share the same MinIO, so a
+  # job is coordinated purely through queue.json CAS: it is claimed by exactly one
+  # indexer, and a crashed indexer's job is reclaimed after its heartbeat goes
+  # stale. Start with:  docker compose --profile indexer up -d --build
+  # Then drive it with:  deploy/queue-demo.sh
+  # ----------------------------------------------------------------------------
+  broker:
+    profiles: ["indexer"]
+    build: { context: ., dockerfile: deploy/Dockerfile.broker }
+    image: tpuf-broker:local
+    container_name: tpuf-broker
+    environment: &queue-env
+      TPUF_BACKEND: s3
+      TPUF_S3_ENDPOINT: http://minio:9000
+      TPUF_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      TPUF_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      TPUF_BUCKET: ${TPUF_BUCKET:-tpuf}
+      BROKER_ID: broker0
+    ports:
+      - "8090:8090" # POST /v1/enqueue, GET /v1/queue
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  # Two indexers, intentionally identical: they prove a job is claimed exactly
+  # once. A short heartbeat timeout makes the crash-and-reclaim demo quick.
+  indexer0: &tpuf-indexer
+    profiles: ["indexer"]
+    build: { context: ., dockerfile: deploy/Dockerfile.indexer }
+    image: tpuf-indexer:local
+    environment: &indexer-env
+      <<: *queue-env
+      WORKER_ID: indexer0
+      TPUF_POLL_INTERVAL: 1s
+      TPUF_HEARTBEAT_TIMEOUT: 15s
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  indexer1:
+    <<: *tpuf-indexer
+    environment:
+      <<: *indexer-env
+      WORKER_ID: indexer1
+
 volumes:
   minio-data:

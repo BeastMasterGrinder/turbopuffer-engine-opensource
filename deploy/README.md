@@ -84,5 +84,73 @@ docker compose --profile lb down          # stop nodes + nginx (MinIO stays up)
 docker compose --profile lb down -v       # also drop the MinIO data volume
 ```
 
-> This is a deliberate **non-goal of the core clone** (the engine is a library + CLI). It lives
-> here as a separate, optional demo of the routing tier described in `docs/01` and `docs/05`.
+---
+
+# Async indexing: broker + indexers + `queue.json` (demo)
+
+turbopuffer keeps indexing **off the query/write path**: writers commit to the WAL and return,
+and a separate fleet of **indexer nodes** asynchronously folds that WAL into search indexes. The
+two fleets are decoupled by an indexing job queue that is itself **a single JSON object on object
+storage** (`queue.json`), coordinated by compare-and-swap and fronted by a **stateless broker**
+that group-commits all queue mutations. ([object-storage queue blog](https://turbopuffer.com/blog/object-storage-queue);
+design write-up: `docs/extensions/broker-indexer-queue.md`.)
+
+Our clone normally indexes **inline** (`tpuf index <ns>`). This profile adds the async scheduling
+*around* the unchanged engine — `tpuf index` still works exactly as before.
+
+> **Flagged as our design:** turbopuffer publishes the *filename* `queue.json`, the CAS retry loop,
+> group commit, heartbeats, FIFO, and at-least-once — but **not** the field layout inside the file
+> or the heartbeat timeout. The `Job` schema (`internal/engine/queue.go`) and the 30 s default
+> timeout are the clone's choices, not quotes.
+
+## Pieces
+
+- **`cmd/tpuf-broker`** — the stateless single-writer to `queue.json`. `POST /v1/enqueue`
+  group-commits reindex notifications (one CAS write per batch); `GET /v1/queue` shows the jobs. It
+  acks a request only after the group commit has landed — durability is on the WAL, the queue is
+  purely a notification.
+- **`cmd/tpuf-indexer`** — the daemon loop: `ClaimNextJob` (CAS ○→◐) → heartbeat while building →
+  the engine's unchanged `BuildIndex` (one manifest CAS publish) → `CompleteJob` (CAS ◐→removed).
+- **`internal/engine/queue.go`** — `queue.json` and its CAS helpers, the **exact** `If-Match`/412
+  shape as the manifest (`SaveQueueCAS` mirrors `SaveManifestCAS`; never cached, fresh read each
+  loop — correctness rule 2).
+- **docker-compose `indexer` profile** — one `broker` + two identical `indexer0/1` over the shared
+  MinIO, so a job is coordinated purely through `queue.json` CAS.
+
+## Run it
+
+```bash
+docker compose --profile indexer up -d --build   # broker + 2 indexers (+ MinIO if not already up)
+deploy/queue-demo.sh                              # upsert (no inline index), enqueue, watch the epoch advance
+```
+
+## What the demo shows
+
+```
+== create + upsert (NO inline index) ==
+  async-demo: upserted; indexEpoch=0 (0 = unindexed, served by WAL-tail scan)
+== notify the broker (group-committed to queue.json) ==
+== watch the indexers claim + drain the job, epoch advancing on its own ==
+  t= 1s  indexEpoch=0  queue={"count":1,"jobs":[{"namespace":"async-demo","state":"in_progress",...}]}
+  t= 2s  indexEpoch=1  queue={"count":0,"jobs":[]}
+  -> epoch advanced to 1 via the async indexer (no inline 'tpuf index' was run)
+== which indexer did the work? ==
+  indexer0: claimed "async-demo" (requestedUpTo=1)
+  indexer0: indexed "async-demo" in 12ms, epoch advanced (no inline index call)
+```
+
+The point: the epoch advances with **no `tpuf index`** call, exactly **one** indexer claims the
+job (the other's CAS loses and it polls on), and queries stay correct throughout — unindexed data
+is searched via the WAL tail until the indexer catches up. The **primary correctness proof** is the
+race test over the in-memory store (`go test ./internal/engine -race -run Queue`); this compose
+profile is the live demo of the same mechanism.
+
+## Teardown
+
+```bash
+docker compose --profile indexer down     # stop broker + indexers (MinIO stays up)
+```
+
+> Like the LB above, this is a deliberate **non-goal of the core clone** (the engine is a library +
+> CLI). It lives here as a separate, optional demo of the indexing tier described in `docs/01`,
+> `docs/05`, and `docs/extensions/broker-indexer-queue.md`.
