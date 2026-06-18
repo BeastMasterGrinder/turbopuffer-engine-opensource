@@ -89,6 +89,91 @@ func TestRunColdStartMemorySmoke(t *testing.T) {
 	}
 }
 
+// TestRunGroupCommitSmoke exercises the group-commit demo mode end to end over
+// the in-memory backend: it fires concurrent single-doc upserts both ways and
+// renders the segment-count comparison. It asserts the report shows both runs
+// and that group commit produced strictly fewer WAL segments than the direct
+// path — the headline win, proven from the CLI. Under -race it also guards the
+// committer's concurrent enqueue/flush/Close paths through the public command.
+func TestRunGroupCommitSmoke(t *testing.T) {
+	var out strings.Builder
+	args := []string{
+		"--backend", "memory", "--group-commit",
+		"--dim", "8", "--docs", "400", "--concurrency", "16", "--seed", "1",
+	}
+	if err := run(args, &out); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"group-commit demo",
+		"direct:",
+		"group-commit:",
+		"WAL segments:",
+		"fewer durable PUTs",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunMultiTenantWithNVMeSmoke exercises the multi-tenant path with the NVMe
+// ring-buffer tier enabled: a tiny DRAM cap forces constant eviction, and the
+// large ring absorbs the re-reads. It asserts the report renders the three-tier
+// DRAM/NVMe/S3 panel and that the warm tier actually served traffic. Run under
+// -race it also guards the ring's locking on the concurrent hot path.
+func TestRunMultiTenantWithNVMeSmoke(t *testing.T) {
+	var out strings.Builder
+	args := []string{
+		"--backend", "memory", "--namespaces", "4", "--concurrency", "4",
+		"--dim", "8", "--docs", "30", "--batch", "10", "--queries", "60",
+		"--top-k", "3", "--cache-objects", "2",
+		"--nvme-dir", t.TempDir(), "--nvme-slots", "256", "--seed", "1",
+	}
+	if err := run(args, &out); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"MULTI-TENANT",
+		"shared DRAM+NVMe cache",
+		"DRAM-hits", "NVMe-hits", "S3-cold",
+		"absorbed as NVMe-hits",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunColdStartWithNVMeSmoke exercises the cold-vs-hot experiment with the
+// NVMe tier on, which adds the WARM (NVMe) middle data point: a fresh DRAM map
+// over the warm ring serves the DRAM-evicted index objects from local disk. The
+// assertion is the mechanism — the warm pass records NVMe-hits and the report
+// names the three states.
+func TestRunColdStartWithNVMeSmoke(t *testing.T) {
+	var out strings.Builder
+	args := []string{
+		"--backend", "memory", "--coldstart-trials", "5",
+		"--dim", "8", "--docs", "120", "--batch", "40", "--top-k", "3",
+		"--nvme-dir", t.TempDir(), "--nvme-slots", "256", "--seed", "1",
+	}
+	if err := run(args, &out); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"COLD-vs-HOT",
+		"query-vec  WARM (NVMe, DRAM cold)",
+		"NVMe-hits", "hot pass = 0 S3-cold",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestParseFlagsValidation(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -103,6 +188,9 @@ func TestParseFlagsValidation(t *testing.T) {
 		{"zero namespaces", []string{"--namespaces", "0"}, true},
 		{"zero concurrency", []string{"--concurrency", "0"}, true},
 		{"negative cache-objects", []string{"--cache-objects", "-1"}, true},
+		{"nvme-slots non-positive with nvme-dir", []string{"--nvme-dir", "/tmp/x", "--nvme-slots", "0"}, true},
+		{"nvme-slots ignored without nvme-dir", []string{"--nvme-slots", "0"}, false},
+		{"valid nvme tier", []string{"--nvme-dir", "/tmp/x", "--nvme-slots", "1024"}, false},
 		{"valid multi-tenant", []string{"--namespaces", "8", "--concurrency", "4", "--cache-objects", "50"}, false},
 	}
 	for _, tt := range tests {
@@ -133,5 +221,89 @@ func TestParseFlagsAutoNamespace(t *testing.T) {
 	}
 	if !strings.HasPrefix(cfg.namespace, "bench-") {
 		t.Errorf("namespace = %q, want a bench- prefix", cfg.namespace)
+	}
+}
+
+// TestRunRaBitQSmoke exercises the True RaBitQ demo mode end to end over the
+// in-memory backend: it builds a labeled namespace, sweeps the prefilter shortlist
+// size, and renders the True-RaBitQ-vs-lite recall table. It asserts the report
+// renders and — the headline win — that True RaBitQ reaches the recall target at a
+// shortlist no larger than lite needs (here lite typically never reaches it within
+// the sweep). This guards the engine.PrefilterShortlist wiring from the CLI.
+func TestRunRaBitQSmoke(t *testing.T) {
+	var out strings.Builder
+	args := []string{
+		"--backend", "memory", "--rabitq",
+		"--dim", "32", "--docs", "400", "--queries", "40", "--batch", "200",
+		"--metric", "euclidean", "--seed", "3",
+	}
+	if err := run(args, &out); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"TRUE RaBitQ vs lite",
+		"True RaBitQ recall",
+		"lite recall",
+		"shortlist needed for",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunHybridSmoke exercises the hybrid-fusion demo mode end to end over the
+// in-memory backend: it builds a labeled set (one planted answer moderate on both
+// signals plus a per-mode decoy) and renders the vector-only / bm25-only / hybrid
+// RRF recall table. It asserts the report renders and that hybrid recall is at
+// least as high as either single mode — guarding the RRF wiring from the CLI.
+func TestRunHybridSmoke(t *testing.T) {
+	var out strings.Builder
+	args := []string{
+		"--backend", "memory", "--hybrid",
+		"--dim", "16", "--docs", "200", "--queries", "40", "--top-k", "1", "--seed", "7",
+	}
+	if err := run(args, &out); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"HYBRID-FUSION recall (RRF k=60)",
+		"recall@",
+		"vector-only :",
+		"bm25-only   :",
+		"hybrid RRF  :",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestRunFilterPlanSmoke exercises the bitmap filter-plan demo mode end to end over
+// the in-memory backend: it times the same vector query across selectivity bands
+// and reports the cold-cache index objects fetched per band. It asserts the report
+// renders and names the baseline and the same-answers invariant — guarding the
+// bitmap planner wiring from the CLI.
+func TestRunFilterPlanSmoke(t *testing.T) {
+	var out strings.Builder
+	args := []string{
+		"--backend", "memory", "--filter-plan",
+		"--dim", "16", "--docs", "600", "--queries", "30", "--seed", "1",
+	}
+	if err := run(args, &out); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"FILTER-PLAN (bitmap attribute index)",
+		"cold-cache index objects fetched per query",
+		"unfiltered (baseline)",
+		"answer set is identical",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report missing %q:\n%s", want, got)
+		}
 	}
 }

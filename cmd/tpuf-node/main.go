@@ -47,13 +47,38 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	store, err := newCache(backend)
+	if err != nil {
+		return err
+	}
 	srv := &nodeServer{
 		id:    envOr("NODE_ID", "node"),
-		store: cache.NewWithCapacity(backend, envInt("TPUF_CACHE_OBJECTS", 0)),
+		store: store,
 	}
 	addr := ":" + envOr("PORT", "8080")
 	log.Printf("tpuf-node %s listening on %s", srv.id, addr)
 	return http.ListenAndServe(addr, srv.routes())
+}
+
+// newCache wraps backend in the per-node DRAM tier (capped by TPUF_CACHE_OBJECTS,
+// 0 = unbounded), plus the optional NVMe ring-buffer tier when TPUF_NVME_DIR is
+// set. The NVMe ring (TPUF_NVME_SLOTS objects, default 1024) models turbopuffer's
+// warm SSD tier: a DRAM miss is served from local disk before the object-storage
+// round-trip, and same-node routing keeps that disk cache warm
+// (docs/extensions/nvme-ring-buffer-cache.md). It is off unless TPUF_NVME_DIR is
+// set, preserving today's DRAM-only behavior.
+func newCache(backend storage.ObjectStore) (*cache.Store, error) {
+	dram := envInt("TPUF_CACHE_OBJECTS", 0)
+	dir := envOr("TPUF_NVME_DIR", "")
+	if dir == "" {
+		return cache.NewWithCapacity(backend, dram), nil
+	}
+	slots := envInt("TPUF_NVME_SLOTS", 1024)
+	store, err := cache.NewWithNVMe(backend, dram, dir, slots)
+	if err != nil {
+		return nil, fmt.Errorf("enabling nvme cache tier at %q: %w", dir, err)
+	}
+	return store, nil
 }
 
 // nodeServer holds the per-node DRAM cache over the shared object store.
@@ -137,7 +162,12 @@ func (s *nodeServer) handleStats(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{
 		"node": s.id,
 		"cache": map[string]any{
-			"hits": c.Hits, "misses": c.Misses, "evictions": c.Evictions, "hitRate": c.HitRate(),
+			"hits":      c.Hits, // alias of dramHits, kept for existing clients
+			"dramHits":  c.DRAMHits,
+			"nvmeHits":  c.NVMeHits,
+			"misses":    c.Misses,
+			"evictions": c.Evictions,
+			"hitRate":   c.HitRate(),
 		},
 	})
 }
