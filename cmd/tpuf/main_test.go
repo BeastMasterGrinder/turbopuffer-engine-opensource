@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"strings"
 	"testing"
@@ -130,4 +131,37 @@ func TestUsageWritesToWriter(t *testing.T) {
 			t.Errorf("usage output missing %q\ngot:\n%s", want, out)
 		}
 	}
+}
+
+// TestRunQueryRankModeGate locks in the rank-mode flag gate after the hybrid
+// change: neither --vector nor --bm25 is still an error, but BOTH together is now
+// accepted (it is the hybrid path) and must pass the gate. We run against the
+// memory backend, which has no persisted namespace, so an accepted request fails
+// LATER at namespace load — never at the flag gate. The pre-hybrid CLI rejected
+// both-flags with "not both", which must no longer happen.
+func TestRunQueryRankModeGate(t *testing.T) {
+	t.Setenv("TPUF_BACKEND", "memory")
+	ctx := context.Background()
+
+	t.Run("neither flag is an error", func(t *testing.T) {
+		err := runQuery(ctx, []string{"demo"})
+		if err == nil || !strings.Contains(err.Error(), "specify --vector") {
+			t.Fatalf("runQuery with no rank mode: got %v, want a 'specify --vector' error", err)
+		}
+	})
+
+	t.Run("both flags are accepted (hybrid), not rejected at the gate", func(t *testing.T) {
+		err := runQuery(ctx, []string{"demo", "--vector", "1,0,0,0", "--bm25", "alpha beta"})
+		// It must get PAST the flag gate: the only error now comes from loading a
+		// non-existent namespace on the fresh memory backend.
+		if err == nil {
+			t.Fatalf("runQuery hybrid against empty memory backend: got nil err, want a namespace-load error")
+		}
+		if strings.Contains(err.Error(), "not both") || strings.Contains(err.Error(), "exactly one") {
+			t.Fatalf("hybrid flags must not be rejected at the gate, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "demo") {
+			t.Fatalf("hybrid request should fail at namespace load, got: %v", err)
+		}
+	})
 }

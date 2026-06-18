@@ -5,10 +5,19 @@
 // Subcommands:
 //
 //	tpuf create <ns> --dim N --metric cosine|euclidean [--text-field F]
+//	tpuf branch <parent> <child>
 //	tpuf upsert <ns> --file docs.json
 //	tpuf index  <ns>
-//	tpuf query  <ns> (--vector "f,f,..." | --bm25 "text") [--top-k K] [--n-probe P] [--filter '<json>']
+//	tpuf query  <ns> (--vector "f,f,..." and/or --bm25 "text") [--top-k K] [--n-probe P] [--filter '<json>']
 //	tpuf info   <ns>
+//
+// branch makes <child> a copy-on-write fork of <parent>: it shares the parent's
+// immutable WAL and index objects by reference (zero bytes copied, O(1)) and
+// diverges only as new writes land on either side
+// (docs/extensions/branches-copy-on-write.md).
+//
+// Passing both --vector and --bm25 runs a hybrid query: the vector and BM25
+// rankings are fused with Reciprocal Rank Fusion (docs/extensions/hybrid-fusion.md).
 //
 // The backend is chosen with TPUF_BACKEND (default "s3"):
 //
@@ -16,6 +25,11 @@
 //	          TPUF_S3_SECRET_KEY, TPUF_BUCKET
 //	memory  — in-process store; data does NOT persist across processes, so it is
 //	          only useful for a single-invocation demo (every run starts empty)
+//
+// Setting TPUF_NVME_DIR enables the optional NVMe ring-buffer cache tier (a
+// fixed-size FIFO of cached index objects on local disk; TPUF_NVME_SLOTS sets its
+// object capacity, default 1024). It is off unless TPUF_NVME_DIR is set, so the
+// default behavior is the plain DRAM-over-object-storage cache.
 package main
 
 import (
@@ -54,6 +68,8 @@ func run(ctx context.Context, args []string) error {
 	switch cmd {
 	case "create":
 		return runCreate(ctx, rest)
+	case "branch":
+		return runBranch(ctx, rest)
 	case "upsert":
 		return runUpsert(ctx, rest)
 	case "index":
@@ -100,6 +116,31 @@ func runCreate(ctx context.Context, args []string) error {
 		return err
 	}
 	fmt.Printf("created namespace %q (dim=%d metric=%s text-field=%q)\n", name, *dim, *metric, *textField)
+	return nil
+}
+
+// runBranch handles: branch <parent> <child>. It creates a copy-on-write fork of
+// <parent> named <child> at the parent's current head — a single manifest PUT,
+// zero data objects copied (docs/extensions/branches-copy-on-write.md). Both
+// names are positional; there are no flags, so the parsing is intentionally
+// simpler than the flag-bearing subcommands.
+func runBranch(ctx context.Context, args []string) error {
+	if len(args) != 2 {
+		return errors.New("usage: tpuf branch <parent> <child>")
+	}
+	parent, child := args[0], args[1]
+	if strings.HasPrefix(parent, "-") || strings.HasPrefix(child, "-") {
+		return errors.New("usage: tpuf branch <parent> <child> (names must not start with '-')")
+	}
+
+	ns, err := openNamespace(ctx, parent)
+	if err != nil {
+		return err
+	}
+	if err := ns.Branch(ctx, child); err != nil {
+		return err
+	}
+	fmt.Printf("branched %q from %q (copy-on-write; shares parent objects, diverges on write)\n", child, parent)
 	return nil
 }
 
@@ -156,7 +197,9 @@ func runIndex(ctx context.Context, args []string) error {
 }
 
 // runQuery handles: query <ns> (--vector "f,f,..." | --bm25 "text") with
-// optional --top-k, --n-probe, and --filter. Exactly one rank mode must be set.
+// optional --top-k, --n-probe, and --filter. Set --vector for a vector query,
+// --bm25 for a BM25 query, or BOTH for a hybrid query whose two rankings are
+// fused with Reciprocal Rank Fusion (docs/extensions/hybrid-fusion.md).
 func runQuery(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("query", flag.ContinueOnError)
 	vector := fs.String("vector", "", `comma-separated query vector, e.g. "0.1,0.2,0.3"`)
@@ -164,18 +207,15 @@ func runQuery(ctx context.Context, args []string) error {
 	topK := fs.Int("top-k", 10, "number of results to return")
 	nProbe := fs.Int("n-probe", 3, "number of IVF clusters to probe (vector mode)")
 	filterJSON := fs.String("filter", "", `attribute filter as JSON, e.g. '{"op":"eq","field":"lang","value":"en"}'`)
-	name, err := parseNamespaceFlags(fs, args, `query <ns> (--vector "f,f,..." | --bm25 "text") [--top-k K] [--n-probe P] [--filter '<json>']`)
+	name, err := parseNamespaceFlags(fs, args, `query <ns> (--vector "f,f,..." and/or --bm25 "text") [--top-k K] [--n-probe P] [--filter '<json>']`)
 	if err != nil {
 		return err
 	}
 
 	hasVector := *vector != ""
 	hasText := *text != ""
-	switch {
-	case hasVector && hasText:
-		return errors.New("specify exactly one of --vector or --bm25, not both")
-	case !hasVector && !hasText:
-		return errors.New("specify exactly one of --vector or --bm25")
+	if !hasVector && !hasText {
+		return errors.New("specify --vector, --bm25, or both (both ⇒ hybrid RRF fusion)")
 	}
 
 	var rankBy engine.RankBy
@@ -185,7 +225,8 @@ func runQuery(ctx context.Context, args []string) error {
 			return err
 		}
 		rankBy.Vector = vec
-	} else {
+	}
+	if hasText {
 		rankBy.Text = *text
 	}
 
@@ -273,14 +314,40 @@ func parseVector(s string) ([]float32, error) {
 	return vec, nil
 }
 
-// openNamespace builds the configured ObjectStore backend, wraps it in the DRAM
-// cache tier, and returns an engine handle to the named namespace.
+// openNamespace builds the configured ObjectStore backend, wraps it in the cache
+// tiers, and returns an engine handle to the named namespace. The DRAM tier is
+// always on; the NVMe ring-buffer tier (docs/extensions/nvme-ring-buffer-cache.md)
+// is optional, enabled by setting TPUF_NVME_DIR (and, optionally,
+// TPUF_NVME_SLOTS — the ring's object capacity, default 1024). With it on, a DRAM
+// miss is served from the local-disk ring before paying the object-storage
+// round-trip, and the warm data survives across CLI invocations.
 func openNamespace(ctx context.Context, name string) (*engine.Namespace, error) {
 	backend, err := newBackend(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return engine.Open(cache.New(backend), name), nil
+	store, err := newCache(backend)
+	if err != nil {
+		return nil, err
+	}
+	return engine.Open(store, name), nil
+}
+
+// newCache wraps backend in the DRAM tier, plus the optional NVMe ring-buffer
+// tier when TPUF_NVME_DIR is set. The DRAM cache is unbounded (the right default
+// for the CLI's single-namespace use); the NVMe ring is sized by
+// TPUF_NVME_SLOTS (objects, default 1024).
+func newCache(backend storage.ObjectStore) (*cache.Store, error) {
+	dir := os.Getenv("TPUF_NVME_DIR")
+	if dir == "" {
+		return cache.New(backend), nil
+	}
+	slots := envIntOr("TPUF_NVME_SLOTS", 1024)
+	store, err := cache.NewWithNVMe(backend, 0, dir, slots)
+	if err != nil {
+		return nil, fmt.Errorf("enabling nvme cache tier at %q: %w", dir, err)
+	}
+	return store, nil
 }
 
 // newBackend selects the ObjectStore implementation from TPUF_BACKEND (default
@@ -329,16 +396,35 @@ func envOr(key, def string) string {
 	return def
 }
 
+// envIntOr returns the integer value of the environment variable key, or def if
+// it is unset, empty, or not a valid positive integer.
+func envIntOr(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
 // usage writes the top-level help text to w.
 func usage(w io.Writer) {
 	fmt.Fprint(w, `tpuf — an educational vector + full-text search engine over object storage
 
 usage:
   tpuf create <ns> --dim N --metric cosine|euclidean [--text-field F]
+  tpuf branch <parent> <child>
   tpuf upsert <ns> --file docs.json
   tpuf index  <ns>
-  tpuf query  <ns> (--vector "f,f,..." | --bm25 "text") [--top-k K] [--n-probe P] [--filter '<json>']
+  tpuf query  <ns> (--vector "f,f,..." and/or --bm25 "text") [--top-k K] [--n-probe P] [--filter '<json>']
   tpuf info   <ns>
+
+  (branch is a copy-on-write fork: shares parent objects, diverges on write)
+
+  (passing both --vector and --bm25 runs a hybrid query fused with RRF)
 
 backend (env TPUF_BACKEND, default "s3"):
   s3      MinIO/S3 via TPUF_S3_ENDPOINT, TPUF_S3_ACCESS_KEY, TPUF_S3_SECRET_KEY, TPUF_BUCKET
