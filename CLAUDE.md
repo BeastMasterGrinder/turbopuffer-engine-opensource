@@ -8,18 +8,24 @@ else exists to hide its latency*. A core engine library plus a CLI (`create | up
 production scale — when a choice is between clever and clear, choose clear.
 
 **Status:** the engine + CLI are implemented under `cmd/tpuf/` and `internal/{storage,cache,engine}/`,
-following the `docs/06` build order. `go test ./...` passes with no infra; the real-MinIO contract test
-runs under `-tags=integration` once `docker compose up` is healthy. The `docs/06` e2e recipe works against
-MinIO end to end.
+following the `docs/06` build order. **All 9 `docs/extensions` non-goal features are also implemented**
+(hybrid RRF fusion, NVMe ring-buffer cache, group commit, bitmap attribute indexes + planner, true
+RaBitQ, copy-on-write branches, broker/indexer + `queue.json`, hierarchical centroid tree, and SPFresh
+LIRE **Phase 1** = Option A incremental rebuild; LIRE Option B/C and a handful of smaller items remain
+deferred — see each KB doc). `go test ./... -race` passes with no infra (165 tests); the real-MinIO
+contract test runs under `-tags=integration` once `docker compose up` is healthy. The full CLI recipe
+(create/upsert/index/query incl. hybrid + filter/info) **and** the copy-on-write branch flow are verified
+end to end against MinIO. The engine still keeps exactly one external dependency.
 
 ## Project map
 
 - `docs/` — the sourced knowledge base (01–07) + primary papers in `docs/papers/`. Start at `docs/README.md`.
 - `go.mod` / `go.sum` — module `github.com/farjad/turbopuffer-clone`, Go 1.26; sole external dep is `aws-sdk-go-v2/service/s3`.
-- `cmd/tpuf/` — the CLI (`create | upsert | index | query | info`); backend via `TPUF_BACKEND=s3|memory`.
-- `cmd/tpuf-bench/` — latency benchmark (p50..p99.9 per op); `internal/bench/` is its percentile-stats helper.
+- `cmd/tpuf/` — the CLI (`create | upsert | index | query | info | branch`; `query` accepts `--vector` and/or `--bm25` — both ⇒ hybrid RRF); backend via `TPUF_BACKEND=s3|memory`.
+- `cmd/tpuf-bench/` — latency benchmark (p50..p99.9 per op) + per-feature demo modes (`--hybrid | --group-commit | --filter-plan | --rabitq | --nvme-dir`); `internal/bench/` is its percentile-stats helper. `benchmarks/run.sh` wraps it; reference numbers in `benchmarks/RESULTS.txt`.
 - `cmd/tpuf-node/` + `deploy/` — optional demo: HTTP query nodes behind an nginx consistent-hash LB (compose `lb` profile); see `deploy/README.md`.
-- `internal/{storage,cache,engine}/` — engine packages (layout per `docs/07`); co-located `*_test.go`.
+- `cmd/tpuf-broker/` + `cmd/tpuf-indexer/` — optional async-indexing daemons coordinating through a CAS-guarded `queue.json` (compose `indexer` profile; `deploy/queue-demo.sh`).
+- `internal/{storage,cache,engine}/` — engine packages (layout per `docs/07`); co-located `*_test.go`. Extension code lives beside the core: `engine/{bitmap,branch,commit,queue,lire}.go`, `cache/nvme.go`.
 
 This repo is **documentation-first**: the hard decisions are already made and sourced in `docs/`. Read
 the relevant doc before building — don't reinvent them.
@@ -29,6 +35,7 @@ the relevant doc before building — don't reinvent them.
 - `docs/06-implementation-blueprint.md` — the code-ready plan: every type, signature, build order, edge cases, and the **5 CAS correctness rules**. Start here when writing engine code.
 - `docs/07-project-layout-and-testing.md` — directory layout and testing strategy.
 - `docs/01`–`05` — architecture, the SPFresh/SPANN vector index, RaBitQ, BM25, and the honest "what we simplify vs turbopuffer" mapping.
+- `docs/extensions/` + `docs/spfresh-lire/` — the KB docs for the 9 now-implemented extensions; `docs/extensions/IMPLEMENTATION-HANDOFF.md` is the build map (files touched, hazards, the deferred items). Read the matching KB doc before changing an extension — each states how it preserves the 5 CAS rules.
 </important>
 
 <important if="you need to run commands to build, test, lint, or run the CLI">

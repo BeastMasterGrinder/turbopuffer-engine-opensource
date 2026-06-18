@@ -4,7 +4,7 @@
 full-text search engine built on one bet — **object storage is the source of truth, and everything
 else exists to hide its latency.**
 
-It is a Go core-engine library plus a CLI (`create | upsert | index | query | info`) that does
+It is a Go core-engine library plus a CLI (`create | upsert | index | query | info | branch`) that does
 **centroid/IVF vector search** and **BM25 full-text search** over **MinIO** (S3-compatible) running in
 Docker. The goal is a *faithful core in readable code* — not production scale. When a choice is between
 clever and clear, this codebase chooses clear.
@@ -71,26 +71,32 @@ The repo follows the official go.dev "single command + supporting packages" shap
 [`docs/07`](./docs/07-project-layout-and-testing.md)): a CLI in `cmd/`, the engine in `internal/`.
 
 ```
-cmd/tpuf/main.go               CLI: create | upsert | index | query | info
-cmd/tpuf-bench/main.go         latency benchmark: p50..p99.9, single/multi-tenant/cold-vs-hot modes
+cmd/tpuf/main.go               CLI: create | upsert | index | query | info | branch
+                                 (query: --vector and/or --bm25; both ⇒ hybrid RRF)
+cmd/tpuf-bench/main.go         latency benchmark: p50..p99.9, single/multi-tenant/cold-vs-hot +
+                                 per-feature demos (--hybrid/--group-commit/--filter-plan/--rabitq/--nvme-dir)
 cmd/tpuf-node/main.go          stateless HTTP query server (for the load-balancer demo)
+cmd/tpuf-broker, tpuf-indexer  async-indexing daemons coordinating via CAS-guarded queue.json
 internal/bench/bench.go        latency Recorder + nearest-rank percentile summary + table renderer
 internal/storage/
   storage.go    ObjectStore interface (Get/PutCAS/PutIfAbsent/Put/List) + sentinel errors
   s3.go         S3(MinIO) impl with CAS (If-Match) — the only file importing the AWS SDK
   memory.go     in-memory ObjectStore with real CAS — infra-free tests & a no-Docker demo mode
-internal/cache/cache.go        DRAM-tier cache over object storage (immutable index objects only)
+internal/cache/
+  cache.go      DRAM-tier cache over object storage (immutable index objects only)
+  nvme.go       NVMe FIFO ring-buffer middle tier (the 3-tier DRAM/NVMe/S3 story)
 internal/engine/
   types.go      Document, WALSegment, Manifest, RankBy, Filter, QueryResult, on-disk index shapes
-  manifest.go   load + CAS-save the manifest
+  manifest.go   load + CAS-save the manifest; branch fork
   wal.go        append / list / read WAL segments; materialize live docs (last-writer-wins)
-  vector.go     cosine/euclidean distances, k-means, RaBitQ-lite codes
+  vector.go     cosine/euclidean distances, k-means, true-RaBitQ rotation+estimator, centroid tree
   bm25.go       tokenizer, inverted index, BM25 scoring
-  indexer.go    build centroid + BM25 + docs index from the WAL, then CAS the epoch swap
-  query.go      planner: vector/BM25 + filters + WAL-tail scan + merge
-  namespace.go  Namespace handle: Create, Upsert, Index, Query, Info
-deploy/                        nginx consistent-hash load-balancer demo (see deploy/README.md)
-benchmarks/                    run.sh (canned bench configs) + RESULTS.txt (saved runs)
+  indexer.go    build centroid + BM25 + bitmaps + docs index from the WAL, then CAS the epoch swap
+  query.go      planner: vector/BM25/hybrid-RRF + bitmap filter plan + WAL-tail scan + merge
+  namespace.go  Namespace handle: Create, Upsert, Index, Query, Info, Branch
+  bitmap.go branch.go commit.go queue.go lire.go   the extension implementations
+deploy/                        nginx LB demo + broker/indexer (indexer profile, queue-demo.sh)
+benchmarks/                    run.sh (canned bench + feature-demo configs) + RESULTS.txt (saved runs)
 ```
 
 ### The three paths
@@ -175,10 +181,10 @@ set -a; source .env.example; set +a                                             
 go run ./cmd/tpuf-bench --backend s3 --docs 500 --batch 50 --queries 50          # real object-storage latency
 ```
 
-A representative MinIO run: the vector **tail scan** lands around p50 16ms / p99 19ms (a manifest read
+A representative MinIO run: the vector **tail scan** lands around p50 15ms / p99 19ms (a manifest read
 plus one object read per WAL segment, every query — the WAL is never cached), while the **indexed** path
-is ~p50 2ms / p99 4ms (only the manifest GET hits MinIO; index objects come from the DRAM cache). Latency
-is dominated by object-storage round-trips, which is exactly what the index and cache exist to hide.
+is ~p50 3.8ms / p99 4.6ms (only the manifest GET hits MinIO; index objects come from the DRAM cache).
+Latency is dominated by object-storage round-trips, which is exactly what the index and cache exist to hide.
 
 **Multi-tenant mode** (`--namespaces N --concurrency C`) is the realistic regime: N tenants are each
 created + indexed, then C worker goroutines issue queries spread across them, sharing one DRAM cache.
@@ -210,14 +216,19 @@ benchmarks/run.sh --backend s3 --mode all  # single + multi-tenant + cold-vs-hot
 
 ### Benchmark results (representative, MinIO on one dev machine — read the *shape*)
 
-Full output and methodology in [`benchmarks/RESULTS.txt`](./benchmarks/RESULTS.txt). The headline findings:
+Full output and methodology in [`benchmarks/RESULTS.txt`](./benchmarks/RESULTS.txt). Single-tenant and
+cold-vs-hot rows re-measured 2026-06-18 (post-extensions). The headline findings:
 
 | What | Measurement | Takeaway |
 |---|---|---|
-| **Index vs. WAL-tail scan** (single tenant) | vector query p50 **18ms → 2.9ms**, p99 **28ms → 4.9ms** | indexing + DRAM cache cut tail latency ~6× |
-| **Cold vs. hot, same query** | vector p50 **13.5ms (cold) → 7.9ms (hot)**, 1.7×; cold pass = 1200 cache misses, hot pass = **0** | the cache's win is the avoided object-storage round-trip |
+| **Index vs. WAL-tail scan** (single tenant) | vector query p50 **15ms → 3.8ms**, p99 **19ms → 4.6ms** | indexing + DRAM cache cut tail latency ~4× |
+| **Cold vs. hot, same query** | vector p50 **17.2ms (cold) → 11.0ms (hot)**, 1.6×; cold pass = 480 cache misses, hot pass = **0** | the cache's win is the avoided object-storage round-trip |
 | **Cache pressure** (12 tenants, dim 256) | bounded 80-obj cache **53.8%** hot, p50 38.8ms, 297 qps → unbounded **99.7%** hot, p50 21.9ms, **520 qps** | a finite DRAM tier degrades gracefully; the manifest read is the latency floor |
 | **Scaling (consistent hashing)** | add a 4th node → **40/50 namespaces stay put**, the 10 that move all go to the new node | scaling doesn't cold-flush existing caches (plain `hash % N` would move ~37/50) |
+
+> All numbers are single-node loopback MinIO and swing with machine load; read the *ratios* (indexed ≪
+> tail, hot ≪ cold), not the absolute milliseconds. On real cloud object storage the per-query manifest
+> GET alone is tens of ms — the floor turbopuffer's NVMe tier and <100 ms target exist to manage.
 
 > Caveat the benchmark surfaces honestly: every query does one **uncached manifest GET** (correctness
 > rule 2), so even a 100%-cache-hit query has a ~object-storage-round-trip floor. Real turbopuffer
@@ -263,41 +274,46 @@ two-step retrieval; a RaBitQ-style binary prefilter then exact rerank; hand-writ
 b=0.75); a single `Query` endpoint whose mode is chosen by `RankBy`; and strong consistency by default
 (the query routes through the manifest, so new writes are always visible).
 
-### Deliberate non-goals (and where each would hook in)
+### Former non-goals — now implemented (and where each hooks in)
 
-Drawn from [`docs/05-clone-mapping.md`](./docs/05-clone-mapping.md):
+[`docs/05-clone-mapping.md`](./docs/05-clone-mapping.md) listed these as deliberate non-goals; as of
+2026-06-18 they are **built** under [`docs/extensions/`](./docs/extensions) (design rationale) +
+[`docs/extensions/IMPLEMENTATION-HANDOFF.md`](./docs/extensions/IMPLEMENTATION-HANDOFF.md) (build map),
+each with co-located `-race` tests and a `cmd/tpuf-bench` or CLI/`deploy/` demo:
 
-- **Group commit** (turbopuffer batches concurrent writes — reported as ~1 WAL entry/sec/namespace) —
-  the clone commits per `upsert`. *Hook:* buffer batches in a goroutine before the WAL write.
-- **Live broker + indexer processes / `queue.json`** — the clone indexes inline via the `index`
-  command. *Hook:* a daemon watching `IndexedUpTo` vs `WALSeq` that CAS-claims jobs.
-- **SPFresh LIRE incremental updates** (split/merge/reassign) — the clone rebuilds the index per `index`
-  run. *Hook:* `internal/engine/indexer.go` would gain incremental rebalancing.
-- **Hierarchical 100×-fan-out centroid tree** — the clone uses one flat centroid level (K ≈ √N). *Hook:*
-  recurse the clustering and store levels.
-- **Bitmap / attribute indexes and a filter-first vs search-first planner** — the clone evaluates
-  filters per candidate. *Hook:* precompute `(attr_value, cluster) → bitmap` in the indexer.
-- **NVMe ring-buffer cache tier** — the clone implements the **DRAM tier** (an in-memory map over MinIO,
-  caching only immutable index objects) and the **S3 tier** (MinIO); the NVMe tier is documented but
-  omitted.
-- **True RaBitQ rotation/unbiased estimator, hybrid fusion, branches/CMEK, multi-region** —
-  documented, not built. (A consistent-hashing **load-balancer demo** *is* included under
-  [`deploy/`](./deploy) — nginx routing namespaces to Go query nodes — but it sits outside the core
-  engine; see [`deploy/README.md`](./deploy/README.md).)
+- **Group commit** — opt-in per-namespace committer coalesces concurrent upserts into one WAL PUT
+  (`internal/engine/commit.go`; `tpuf-bench --group-commit` shows ~8× fewer PUTs).
+- **Live broker + indexer processes / `queue.json`** — async-indexing daemons claim jobs via the same
+  CAS shape as the manifest (`cmd/tpuf-broker`, `cmd/tpuf-indexer`; compose `indexer` profile).
+- **SPFresh LIRE incremental updates** — **Phase 1** (Option A: incremental rebuild — split/merge/
+  reassign + per-vector version — behind the unchanged single-CAS epoch) in `internal/engine/lire.go`;
+  Option B/C deferred.
+- **Hierarchical centroid tree** — recursive k-means levels in `centroids.json` (`vector.go`); measured
+  fan-out honestly shows it's pedagogical at this N.
+- **Bitmap / attribute indexes + filter-first vs search-first planner** — `index/v{epoch}/bitmaps.json`
+  (`internal/engine/bitmap.go`); same answers as the per-candidate path, less I/O when selective.
+- **NVMe ring-buffer cache tier** — a FIFO disk tier under the DRAM map (`internal/cache/nvme.go`),
+  making the real 3-tier DRAM/NVMe/S3 story (`tpuf-bench --nvme-dir`).
+- **True RaBitQ rotation + unbiased estimator** (`vector.go`), **hybrid RRF fusion**
+  (`tpuf query --vector --bm25`), and **copy-on-write branches** (`tpuf branch`, `internal/engine/branch.go`).
+  (The consistent-hashing **load-balancer demo** under [`deploy/`](./deploy) remains too.) Still
+  documented-not-built: CMEK, multi-region, LIRE Option B, weighted score fusion, branch GC.
 
-These simplifications all preserve the behavior that makes the architecture interesting while dropping
-scale machinery (hierarchy depth, incremental rebalancing, ring buffers) that only earns its complexity
-at billions of vectors.
+These additions all preserve the behavior that makes the architecture interesting (and the 5 CAS
+correctness rules); the scale machinery is implemented at clone scale to *show its shape*, not to chase
+billions-of-vectors performance.
 
 ---
 
 ## Status
 
-The engine, CLI, benchmark tool, and load-balancer demo are **implemented and tested**: `go test ./...`
-passes (unit tests, no infrastructure), `go test ./... -race` is clean, and the real-MinIO contract test
-passes under `-tags=integration`. The full end-to-end recipe in
-[`docs/06`](./docs/06-implementation-blueprint.md) runs against MinIO. The research and design remain
-sourced in [`docs/`](./docs).
+The engine, CLI, benchmark tool, load-balancer demo, **all 8 `docs/extensions` features, and SPFresh
+LIRE Phase 1** are **implemented and tested**: `go test ./... -race` is clean (165 tests, no
+infrastructure), and the real-MinIO contract test passes under `-tags=integration`. The full end-to-end
+recipe in [`docs/06`](./docs/06-implementation-blueprint.md) — plus hybrid queries, attribute filters,
+and the copy-on-write branch flow — is verified against MinIO. The research and design remain sourced in
+[`docs/`](./docs); the extension build map is
+[`docs/extensions/IMPLEMENTATION-HANDOFF.md`](./docs/extensions/IMPLEMENTATION-HANDOFF.md).
 
 The **engine's** single external dependency is `aws-sdk-go-v2/service/s3`. Everything conceptually
 interesting — vector math, k-means, the RaBitQ-lite codes, BM25, and the CAS loop — is hand-written

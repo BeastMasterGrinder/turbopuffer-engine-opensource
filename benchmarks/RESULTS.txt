@@ -6,6 +6,11 @@ are hardware-dependent (this is one developer machine, MinIO in local Docker), s
 read the *shape* — the gap between the unindexed WAL-tail scan and the indexed
 path, and the cold-vs-hot cache breakdown — not the absolute milliseconds.
 
+The core latency tables come first; the docs/extensions feature demos (hybrid
+fusion, NVMe tier, group commit, bitmap filter plan, True RaBitQ) are in the
+EXTENSION FEATURE DEMOS section at the bottom. Run everything with
+`benchmarks/run.sh --mode all` (or one mode: hybrid|nvme|groupcommit|filterplan|rabitq).
+
 Toolchain: Go 1.26.1, MinIO in docker-compose (path-style S3, localhost:9000).
 Run parameters (both backends): dim=64 metric=cosine text-field=body
                                 docs=500 batch=50 (=10 WAL segments)
@@ -200,3 +205,63 @@ bytes, so the JSON unmarshal + BM25 scoring still run on every (cold AND hot)
 query. bm25.json/docs.json for 3000 docs are large, so fetch is a smaller fraction
 of total query time than for vector's 4 smaller objects. The cache saves network,
 not compute.
+
+
+========================================================================
+EXTENSION FEATURE DEMOS (2026-06-18, memory backend)
+========================================================================
+The docs/extensions features each ship a tpuf-bench mode that proves its win.
+These measure recall / WAL-segment / cold-I/O COUNTS, not wall-clock, so the
+memory backend is the right place to read them (no network noise). Reproduce any
+row with `benchmarks/run.sh --mode <name>` or the command shown.
+
+--- F1  Hybrid fusion (RRF k=60) ---------------------------------------
+  go run ./cmd/tpuf-bench --hybrid --dim 32 --docs 1000 --queries 100 --top-k 1 --seed 7
+  Each query plants one answer that is moderate on BOTH signals, plus a
+  vector-only decoy (literal nearest neighbor) and a bm25-only decoy (BM25 #1).
+  recall@1 of the planted answer:   vector-only 0.0%   bm25-only 0.0%   hybrid 99.0%
+  Each single mode's top slot is taken by its own decoy; only RRF (Σ 1/(60+rank)
+  across both ranked lists) floats the consistent-in-both doc to #1.
+
+--- F2  NVMe ring-buffer cache (3-tier DRAM/NVMe/S3) -------------------
+  go run ./cmd/tpuf-bench --namespaces 8 --concurrency 8 --dim 64 --docs 300 \
+      --queries 3000 --cache-objects 4 --nvme-dir <tmp> --nvme-slots 1024
+  DRAM capped at 4 objects forces constant eviction; the ring absorbs the re-reads:
+    query-vec  load :  607 DRAM-hits  11285 NVMe-hits  108 S3-cold  → 99.1% warm
+    query-bm25 load : 1381 DRAM-hits   4603 NVMe-hits   16 S3-cold  → 99.7% warm
+  Without the ring those NVMe-hits would all be S3-cold reads (≈3.6% hot). The
+  ring caches ONLY immutable index/v{epoch}/* objects — never the manifest/WAL.
+
+--- F3  Group commit (WAL segment count) ------------------------------
+  go run ./cmd/tpuf-bench --group-commit --docs 1000 --concurrency 32 --dim 16 --seed 1
+  1000 concurrent single-doc upserts:
+    direct (one PUT each) : 924 WAL segments   [76 upserts FAILED on append contention]
+    group-commit          : 117 WAL segments   = 7.9x fewer durable PUTs, 0 failures
+  Same durable-before-return contract; the coalesced batch is just bigger. (Ratio
+  is timing-dependent on the coalescing window — expect ~3-10x at this concurrency.)
+
+--- F4  Bitmap attribute index + filter planner -----------------------
+  go run ./cmd/tpuf-bench --filter-plan --docs 2000 --dim 32 --queries 60 --seed 1
+  Same vector query across selectivity bands; cold-cache index objects fetched/query:
+    unfiltered (baseline) 4.0    sel=rare 2.0    sel=narrow 2.0    sel=mid 3.5    sel=broad 2.7
+  Selective bands run filter-first (intersect bitmaps → score only matches → fetch
+  only their clusters) at ~half the I/O; broad filters fall back to a pruned
+  search-first scan. The answer set is IDENTICAL to the per-candidate path in every
+  band (cross-checked vs brute force) — same answers, less work.
+
+--- F5  True RaBitQ (recall vs prefilter shortlist) -------------------
+  go run ./cmd/tpuf-bench --rabitq --dim 64 --docs 800 --queries 50 --metric euclidean --seed 7
+  Recall of the exact nearest neighbor as the prefilter shortlist grows:
+    shortlist     1     2     5    10    20    50
+    True RaBitQ  29%   45%   68%   87%  100%  100%
+    lite         16%   19%   36%   48%   68%   81%
+  True RaBitQ reaches >=90% recall at shortlist 20; lite never reaches it within
+  the sweep. The unbiased estimator (O(1/√D) error) keeps the true neighbor in a
+  far smaller shortlist — the smaller-shortlist-at-fixed-recall win.
+
+Note: absolute numbers are hardware/seed-dependent; read the comparative shape
+(hybrid > either mode; ring warm% >> baseline; grouped << direct segments;
+selective < baseline I/O; True RaBitQ > lite). The S3/MinIO core latency tables
+above predate the extensions — rerun `benchmarks/run.sh --backend s3 --mode core`
+after `docker compose up -d` to refresh them; the extensions are additive and off
+by default, so the core query path's latency shape is unchanged.

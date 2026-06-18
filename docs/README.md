@@ -25,6 +25,24 @@ See [`papers/SOURCES.md`](./papers/SOURCES.md). Short version:
 - **SPANN** (NeurIPS '21) → `papers/spann-neurips21.pdf` — the centroid/posting-list index SPFresh builds on.
 - **RaBitQ** (SIGMOD '24) → `papers/rabitq-sigmod24.pdf` — the binary quantization used to score inside a cluster.
 
+## Extending the clone (the former non-goals — now built)
+
+The core clone deliberately stopped short of production scale; `05-clone-mapping.md` records each thing
+it originally **didn't** build. Two folders expanded those non-goals into buildable designs — and, as of
+2026-06-18, the designs have been implemented (`go test ./... -race` green; each proven in
+`cmd/tpuf-bench` or a CLI/`deploy/` demo). The KB docs remain the sourced *design rationale*.
+
+- [`extensions/`](./extensions) — the **low/medium-effort** non-goals, each a self-contained addition
+  that preserves the existing architecture: group commit, the broker/indexer + `queue.json`, the NVMe
+  ring-buffer cache tier, bitmap attribute indexes + filter planner, hybrid vector/BM25 fusion, the
+  hierarchical centroid tree, true RaBitQ rotation, and copy-on-write branches — **all implemented**. See
+  [`extensions/README.md`](./extensions/README.md).
+- [`spfresh-lire/`](./spfresh-lire) — the **genuinely hard** non-goal: SPFresh's **LIRE** incremental
+  rebalancing (split / merge / reassign), the core contribution of the paper turbopuffer's index is based
+  on. **Phase 1 (Option A — incremental rebuild behind the unchanged single-CAS epoch) is implemented**;
+  the deeper phases stay documented-not-built. Read in order 00 → 01 → 02; start at
+  [`spfresh-lire/README.md`](./spfresh-lire/README.md).
+
 ## The one-sentence summary
 
 > Object storage is cheap, durable, and (since 2020) strongly consistent — so make it the **source
