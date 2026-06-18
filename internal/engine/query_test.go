@@ -404,12 +404,8 @@ func TestRunQueryErrors(t *testing.T) {
 			params:  QueryParams{TopK: 3},
 			wantSub: "no rank mode set",
 		},
-		{
-			name:    "both rank modes",
-			cfg:     testConfig(),
-			params:  QueryParams{RankBy: RankBy{Vector: []float32{1, 0, 0, 0}, Text: "hi"}, TopK: 3},
-			wantSub: "both vector and text",
-		},
+		// Both rank modes set is no longer an error: it is the hybrid path, covered
+		// by hybrid_test.go.
 		{
 			name:    "bm25 with no text field",
 			cfg:     NamespaceConfig{Dimension: 4, Metric: "cosine", TextField: ""},

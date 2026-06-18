@@ -44,6 +44,22 @@ func (n *Namespace) Create(ctx context.Context, cfg NamespaceConfig) error {
 	return CreateManifest(ctx, n.store, n.name, cfg)
 }
 
+// Branch creates a copy-on-write fork of this namespace named child, forking at
+// this namespace's current head. The child shares this namespace's immutable WAL
+// segments and index epoch by reference (zero data objects copied — an O(1)
+// manifest PUT regardless of size) and diverges only as new writes land on
+// either side; the two are fully independent afterward, each its own CAS head
+// (docs/extensions/branches-copy-on-write.md). The child inherits this
+// namespace's schema; it cannot choose a different vector shape because it shares
+// the index. The error is passed through unwrapped because BranchFrom already
+// names both namespaces.
+//
+// GC pin (no garbage collector exists today): the child PINS this namespace's
+// objects — see the hazard note at the top of branch.go.
+func (n *Namespace) Branch(ctx context.Context, child string) error {
+	return BranchFrom(ctx, n.store, n.name, child)
+}
+
 // Upsert durably appends docs to the namespace and returns only once they are
 // committed (durable-before-return): the WAL segment is written first, then the
 // manifest CAS advances WALSeq so the data is part of the namespace's source of
@@ -75,6 +91,19 @@ func (n *Namespace) Upsert(ctx context.Context, docs []Document) error {
 		return fmt.Errorf("upserting into %q: %w", n.name, err)
 	}
 
+	return n.commitBatch(ctx, m.WALSeq, docs)
+}
+
+// commitBatch is the durable write path shared by the direct Upsert above and
+// the group-commit Committer (commit.go): given a starting seq hint and a
+// (possibly merged) batch of validated docs, it claims a WAL seq with a single
+// PutIfAbsent loop and advances the manifest with a single CAS. Validation is
+// deliberately NOT done here — the caller validates each writer's docs against
+// the manifest dimension before they are merged, so one malformed vector fails
+// only its own caller rather than poisoning a coalesced batch (docs/extensions/
+// group-commit.md). seqHint is just where the PutIfAbsent probe starts; the 412
+// loop and the CAS both tolerate a stale hint.
+func (n *Namespace) commitBatch(ctx context.Context, seqHint int64, docs []Document) error {
 	// liveDelta is the net change to the live document count this batch makes:
 	// +1 per upsert, -1 per tombstone. It is informational (DocCount is
 	// authoritatively recomputed at index time), so we clamp it at zero to keep
@@ -94,7 +123,7 @@ func (n *Namespace) Upsert(ctx context.Context, docs []Document) error {
 	// until the winning writer's CAS lands — guarantees forward progress: N
 	// concurrent writers that all start at the same seq settle into N distinct
 	// slots in at most N probes, so the loop never livelocks on a stale count.
-	seq := m.WALSeq
+	seq := seqHint
 	committedSeq := int64(-1)
 	for attempt := 0; attempt < maxUpsertAttempts; attempt++ {
 		err := AppendWAL(ctx, n.store, n.name, seq, docs)
@@ -145,8 +174,41 @@ func (n *Namespace) validateDocs(dim int, docs []Document) error {
 // next epoch's coverage and stay searchable via the query tail (correctness
 // rules 3 and 4 live in BuildIndex). The error is passed through unwrapped
 // because BuildIndex already names the namespace.
+//
+// This is the INLINE index path — synchronous, in the calling process. It stays
+// fully supported alongside the async broker/indexer/queue.json scheduling
+// (docs/extensions/broker-indexer-queue.md): the daemons just call this same
+// BuildIndex from a separate process, so nothing about the publish changes.
 func (n *Namespace) Index(ctx context.Context) error {
 	return BuildIndex(ctx, n.store, n.name)
+}
+
+// EnqueueReindexIfBehind notes that this namespace may need (re)indexing IF its
+// unindexed WAL tail has grown past threshold segments — the clone's analog of
+// turbopuffer's unindexed_bytes (docs/extensions/broker-indexer-queue.md). It is
+// a best-effort NOTIFICATION layered on top of the already-durable write path,
+// never part of it: durability lives on the WAL (rule 1), and if this enqueue
+// lagged or failed no data is lost because queries still scan the WAL tail (rule
+// 5) until an indexer catches up. The enqueue itself is idempotent and
+// deduplicated on namespace, so a writer may call this after every Upsert.
+//
+// It reads the manifest FRESH (rule 2, via Info — never cached) to measure the
+// lag WALSeq - IndexedUpTo, and returns whether a NEW job was enqueued. A
+// threshold of 0 or negative means "enqueue whenever there is any unindexed WAL".
+func (n *Namespace) EnqueueReindexIfBehind(ctx context.Context, threshold int64) (bool, error) {
+	m, err := n.Info(ctx)
+	if err != nil {
+		return false, err
+	}
+	lag := m.WALSeq - m.IndexedUpTo
+	if lag <= 0 || lag < threshold {
+		return false, nil
+	}
+	added, err := EnqueueReindex(ctx, n.store, n.name, m.WALSeq)
+	if err != nil {
+		return false, fmt.Errorf("enqueuing reindex for %q: %w", n.name, err)
+	}
+	return added, nil
 }
 
 // Query answers p against the live index and the unindexed WAL tail, so freshly

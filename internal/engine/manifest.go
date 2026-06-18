@@ -42,6 +42,17 @@ func LoadManifest(ctx context.Context, store *cache.Store, ns string) (Manifest,
 	return m, etag, nil
 }
 
+// marshalManifest encodes a manifest to its on-disk JSON form, naming the error
+// the way every writer wants it. It is the single place manifests are marshaled,
+// so CreateManifest, BranchFrom, and the CAS loop all serialize identically.
+func marshalManifest(m Manifest) ([]byte, error) {
+	body, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("encoding manifest: %w", err)
+	}
+	return body, nil
+}
+
 // CreateManifest writes the initial manifest for a new namespace using a
 // write-once PutIfAbsent, so two concurrent creators can never both succeed
 // (correctness rule 1's write-once cousin). The 412 loser gets a clear
@@ -58,7 +69,7 @@ func CreateManifest(ctx context.Context, store *cache.Store, ns string, cfg Name
 		DocCount:    0,
 	}
 
-	body, err := json.Marshal(m)
+	body, err := marshalManifest(m)
 	if err != nil {
 		return fmt.Errorf("encoding manifest for %q: %w", ns, err)
 	}
